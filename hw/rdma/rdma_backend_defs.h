@@ -24,8 +24,21 @@ typedef struct RdmaDeviceResources RdmaDeviceResources;
 typedef struct RdmaBackendThread {
     QemuThread thread;
     QemuMutex mutex;
-    bool run;
+    bool run; /* Set by thread manager to let thread know it should exit */
+    bool is_running; /* Set by the thread when it is done */
 } RdmaBackendThread;
+
+typedef struct RecvMadList {
+    QemuMutex lock;
+    QList *list;
+} RecvMadList;
+
+typedef struct BackendMadAgent {
+    int port_id;
+    int agent_id;
+    RecvMadList recv_mads_list;
+    RdmaBackendThread recv_thread;
+} BackendMadAgent;
 
 typedef struct RdmaBackendDev {
     struct ibv_device_attr dev_attr;
@@ -38,6 +51,7 @@ typedef struct RdmaBackendDev {
     struct ibv_comp_channel *channel;
     uint8_t port_num;
     uint8_t backend_gid_idx;
+    BackendMadAgent mad_agent;
 } RdmaBackendDev;
 
 typedef struct RdmaBackendPD {

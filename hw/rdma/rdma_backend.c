@@ -16,8 +16,12 @@
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "qapi/qmp/qlist.h"
+#include "qapi/qmp/qnum.h"
 
 #include <infiniband/verbs.h>
+#include <infiniband/umad_types.h>
+#include <infiniband/umad.h>
 
 #include "trace.h"
 #include "rdma_utils.h"
@@ -25,6 +29,7 @@
 #include "rdma_backend.h"
 
 /* Vendor Errors */
+#define VENDOR_ERR_FATAL            0x200
 #define VENDOR_ERR_FAIL_BACKEND     0x201
 #define VENDOR_ERR_TOO_MANY_SGES    0x202
 #define VENDOR_ERR_NOMEM            0x203
@@ -33,14 +38,26 @@
 #define VENDOR_ERR_MAD_SEND         0x206
 #define VENDOR_ERR_INVLKEY          0x207
 #define VENDOR_ERR_MR_SMALL         0x208
+#define VENDOR_ERR_UMAD_RECV_FAIL   0x209
+#define VENDOR_ERR_INV_MAD_BUFF     0x210
 
 #define THR_NAME_LEN 16
 
+#define MAD_SERVICE  0x7
+#define UMAD_RECV_TO 5000
+#define MAD_BUF_SIZE 256
+#define MAD_HDR_SIZE sizeof(struct ibv_grh)
+
 typedef struct BackendCtx {
-    uint64_t req_id;
     void *up_ctx;
     bool is_tx_req;
+    struct ibv_sge sge; /* Used to save MAD recv buffer */
 } BackendCtx;
+
+struct backend_umad {
+    struct ib_user_mad hdr;
+    char mad[MAD_BUF_SIZE];
+};
 
 static void (*comp_handler)(int status, unsigned int vendor_err, void *ctx);
 
@@ -94,6 +111,8 @@ static void *comp_handler_thread(void *arg)
 
     pr_dbg("Starting\n");
 
+    backend_dev->comp_thread.is_running = true;
+
     while (backend_dev->comp_thread.run) {
         pr_dbg("Waiting for completion on channel %p\n", backend_dev->channel);
         rc = ibv_get_cq_event(backend_dev->channel, &ev_cq, &ev_ctx);
@@ -117,7 +136,37 @@ static void *comp_handler_thread(void *arg)
 
     /* TODO: Post cqe for all remaining buffs that were posted */
 
+    backend_dev->comp_thread.is_running = false;
+
+    qemu_thread_exit(0);
+
     return NULL;
+}
+
+static void start_comp_thread(RdmaBackendDev *backend_dev)
+{
+    char thread_name[THR_NAME_LEN] = {0};
+
+    /* Temp hack since we can't stop the thread (blocking on
+     * ibv_get_cq_event call) then make sure it started only once. */
+    if (backend_dev->comp_thread.run) {
+        return;
+    }
+
+    snprintf(thread_name, sizeof(thread_name), "rdma_comp_%s",
+             ibv_get_device_name(backend_dev->ib_dev));
+    backend_dev->comp_thread.run = true;
+    qemu_thread_create(&backend_dev->comp_thread.thread, thread_name,
+                       comp_handler_thread, backend_dev, QEMU_THREAD_DETACHED);
+}
+
+static void stop_comp_thread(RdmaBackendDev *backend_dev)
+{
+    /* Temp hack since we can't stop the thread (blocking on
+     * ibv_get_cq_event call) then make sure it started only once.
+    backend_dev->comp_thread.run = false;
+    qemu_thread_join(&backend_dev->comp_thread.thread);
+    */
 }
 
 void rdma_backend_register_comp_handler(void (*handler)(int status,
@@ -239,6 +288,67 @@ static int build_host_sge_array(RdmaDeviceResources *rdma_dev_res,
     return 0;
 }
 
+static void print_hex(const char *msg, const char *data, int len)
+{
+    int i;
+    char *out = g_malloc0(len * 3 + 1);
+    char *p = out;
+
+    out[0] = 0;
+    for (i = 0; i < len; i++)
+        sprintf(out, "%s %02X", p, (unsigned char)data[i]);
+
+    pr_dbg("%s (len=%d): %s\n", msg, len, out);
+    g_free(out);
+}
+
+static int mad_send(RdmaBackendDev *backend_dev, struct ibv_sge *sge,
+                    uint32_t num_sge)
+{
+    struct backend_umad umad = {0};
+    char *hdr, *msg;
+    int ret;
+
+    pr_dbg("num_sge=%d\n", num_sge);
+
+    if (num_sge != 2)
+        return -EINVAL;
+
+    umad.hdr.length = sge[0].length + sge[1].length;
+    pr_dbg("msg_len=%d\n", umad.hdr.length);
+
+    if (umad.hdr.length > sizeof(umad.mad))
+        return -ENOMEM;
+
+    umad.hdr.addr.qpn = htobe32(1);
+    umad.hdr.addr.grh_present = 1;
+    umad.hdr.addr.gid_index = backend_dev->backend_gid_idx;
+    memcpy(umad.hdr.addr.gid, backend_dev->gid.raw, sizeof(umad.hdr.addr.gid));
+    umad.hdr.addr.hop_limit = 1;
+
+    hdr = rdma_pci_dma_map(backend_dev->dev, sge[0].addr, sge[0].length);
+    //hdr[1] = 0x32;
+    print_hex("send_hdr", hdr, sge[0].length);
+    msg = rdma_pci_dma_map(backend_dev->dev, sge[1].addr, sge[1].length);
+    print_hex("send_data", msg, sge[1].length);
+
+    memcpy(&umad.mad[0], hdr, sge[0].length);
+    memcpy(&umad.mad[sge[0].length], msg, sge[1].length);
+
+    rdma_pci_dma_unmap(backend_dev->dev, hdr, sge[0].length);
+    rdma_pci_dma_unmap(backend_dev->dev, msg, sge[1].length);
+
+    ret = umad_send(backend_dev->mad_agent.port_id,
+                    backend_dev->mad_agent.agent_id,
+                    &umad, umad.hdr.length , 1, 0);
+
+    if (ret) {
+        pr_dbg("Fail to send MAD message, err=%d\n", ret);
+    }
+
+    return ret;
+}
+
 void rdma_backend_post_send(RdmaBackendDev *backend_dev,
                             RdmaBackendQP *qp, uint8_t qp_type,
                             struct ibv_sge *sge, uint32_t num_sge,
@@ -257,9 +367,13 @@ void rdma_backend_post_send(RdmaBackendDev *backend_dev,
             comp_handler(IBV_WC_GENERAL_ERR, VENDOR_ERR_QP0, ctx);
         } else if (qp_type == IBV_QPT_GSI) {
             pr_dbg("QP1\n");
-            comp_handler(IBV_WC_GENERAL_ERR, VENDOR_ERR_MAD_SEND, ctx);
+            rc = mad_send(backend_dev, sge, num_sge);
+            if (!rc) {
+                comp_handler(IBV_WC_SUCCESS, 0, ctx);
+            } else {
+                comp_handler(IBV_WC_GENERAL_ERR, VENDOR_ERR_MAD_SEND, ctx);
+            }
         }
-        pr_dbg("qp->ibqp is NULL for qp_type %d!!!\n", qp_type);
         return;
     }
 
@@ -319,6 +433,38 @@ out_free_bctx:
     g_free(bctx);
 }
 
+static unsigned int save_mad_recv_buffer(RdmaBackendDev *backend_dev,
+                                         struct ibv_sge *sge, void *ctx)
+{
+    BackendCtx *bctx;
+    int rc;
+    uint32_t bctx_id;
+
+    if (sge[0].length < MAD_BUF_SIZE + sizeof(struct ibv_grh)) {
+        pr_dbg("Too small buffer for MAD\n");
+        return VENDOR_ERR_INV_MAD_BUFF;
+    }
+
+    bctx = g_malloc0(sizeof(*bctx));
+
+    rc = rdma_rm_alloc_cqe_ctx(backend_dev->rdma_dev_res, &bctx_id, bctx);
+    if (unlikely(rc)) {
+        g_free(bctx);
+        pr_dbg("Fail to allocate cqe_ctx\n");
+        return VENDOR_ERR_NOMEM;
+    }
+
+    pr_dbg("id %d, bctx %p, ctx %p\n", bctx_id, bctx, ctx);
+    bctx->up_ctx = ctx;
+    bctx->sge = *sge;
+
+    qemu_mutex_lock(&backend_dev->mad_agent.recv_mads_list.lock);
+    qlist_append_int(backend_dev->mad_agent.recv_mads_list.list, bctx_id);
+    qemu_mutex_unlock(&backend_dev->mad_agent.recv_mads_list.lock);
+
+    return 0;
+}
+
 void rdma_backend_post_recv(RdmaBackendDev *backend_dev,
                             RdmaDeviceResources *rdma_dev_res,
                             RdmaBackendQP *qp, uint8_t qp_type,
@@ -337,7 +483,13 @@ void rdma_backend_post_recv(RdmaBackendDev *backend_dev,
         }
         if (qp_type == IBV_QPT_GSI) {
             pr_dbg("QP1\n");
-            comp_handler(IBV_WC_GENERAL_ERR, VENDOR_ERR_MAD_SEND, ctx);
+            if (num_sge != 1) {
+                comp_handler(IBV_WC_GENERAL_ERR, VENDOR_ERR_NO_SGE, ctx);
+                return;
+            }
+            rc = save_mad_recv_buffer(backend_dev, sge, ctx);
+            if (rc)
+                comp_handler(IBV_WC_GENERAL_ERR, rc, ctx);
         }
         return;
     }
@@ -466,7 +618,6 @@ int rdma_backend_create_qp(RdmaBackendQP *qp, uint8_t qp_type,
 
     switch (qp_type) {
     case IBV_QPT_GSI:
-        pr_dbg("QP1 unsupported\n");
         return 0;
 
     case IBV_QPT_RC:
@@ -697,7 +848,192 @@ static int init_device_caps(RdmaBackendDev *backend_dev,
     return 0;
 }
 
-int rdma_backend_init(RdmaBackendDev *backend_dev,
+static void *mad_handler_thread(void *arg)
+{
+    RdmaBackendDev *backend_dev = (RdmaBackendDev *)arg;
+    int rc;
+    QObject *o_ctx_id;
+    unsigned long cqe_ctx_id;
+    BackendCtx *bctx;
+    int len;
+    char *mad;
+    struct backend_umad umad;
+
+    pr_dbg("Starting\n");
+
+    pr_dbg("sizeof(ib_user_mad)=%ld\n", sizeof(struct ib_user_mad));
+    pr_dbg("sizeof(umad_hdr)=%ld\n", sizeof(struct umad_hdr));
+    pr_dbg("MAD_HDR_SIZE=%ld\n", MAD_HDR_SIZE);
+
+    backend_dev->mad_agent.recv_thread.is_running = true;
+
+    while (backend_dev->mad_agent.recv_thread.run) {
+        do {
+            len = sizeof(umad.mad);
+            rc = umad_recv(backend_dev->mad_agent.port_id, &umad, &len,
+                           UMAD_RECV_TO);
+            if (rc != -ETIMEDOUT) {
+                pr_dbg("umad_recv=%d, len=%d\n", rc, len);
+            }
+        } while (rc && backend_dev->mad_agent.recv_thread.run);
+
+        if (backend_dev->mad_agent.recv_thread.run && !rc) {
+#ifdef PVRDMA_DEBUG
+            struct umad_hdr *hdr;
+            hdr = (struct umad_hdr *)&umad.mad;
+#endif
+            pr_dbg("bv %x cls %x cv %x mtd %x st %d tid %" PRIx64 "x at %x atm %x\n",
+                   hdr->base_version, hdr->mgmt_class, hdr->class_version,
+                   hdr->method, hdr->status, be64toh(hdr->tid),
+                   hdr->attr_id, hdr->attr_mod);
+
+            qemu_mutex_lock(&backend_dev->mad_agent.recv_mads_list.lock);
+            o_ctx_id = qlist_pop(backend_dev->mad_agent.recv_mads_list.list);
+            qemu_mutex_unlock(&backend_dev->mad_agent.recv_mads_list.lock);
+            if (!o_ctx_id) {
+                 pr_dbg("No more free MADs buffers, waiting for a while\n");
+                 sleep(UMAD_RECV_TO);
+                 continue;
+            }
+
+            cqe_ctx_id = qnum_get_uint(qobject_to(QNum, o_ctx_id));
+            bctx = rdma_rm_get_cqe_ctx(backend_dev->rdma_dev_res, cqe_ctx_id);
+            if (unlikely(!bctx)) {
+                pr_dbg("Error: Fail to find ctx for %ld\n", cqe_ctx_id);
+                continue;
+            }
+
+            pr_dbg("id %ld, bctx %p, ctx %p\n", cqe_ctx_id, bctx, bctx->up_ctx);
+
+            mad = rdma_pci_dma_map(backend_dev->dev, bctx->sge.addr,
+                                   bctx->sge.length);
+            if (!mad || bctx->sge.length < len + MAD_HDR_SIZE) {
+                comp_handler(IBV_WC_GENERAL_ERR, VENDOR_ERR_INV_MAD_BUFF,
+                             bctx->up_ctx);
+            } else {
+                memset(&mad[MAD_HDR_SIZE], 0, bctx->sge.length - MAD_HDR_SIZE);
+                memcpy(&mad[MAD_HDR_SIZE], umad.mad, len);
+                print_hex("recv_data", mad, MAD_HDR_SIZE + len);
+                print_hex("recv_data[MAD_HDR_SIZE]", &mad[MAD_HDR_SIZE], len);
+                rdma_pci_dma_unmap(backend_dev->dev, mad, bctx->sge.length);
+
+                comp_handler(IBV_WC_SUCCESS, 0, bctx->up_ctx);
+            }
+
+            rdma_rm_dealloc_cqe_ctx(backend_dev->rdma_dev_res, cqe_ctx_id);
+            g_free(bctx);
+        }
+    }
+
+    pr_dbg("Going down\n");
+
+    /* Clear MAD buffers list */
+    qemu_mutex_lock(&backend_dev->mad_agent.recv_mads_list.lock);
+    do {
+        o_ctx_id = qlist_pop(backend_dev->mad_agent.recv_mads_list.list);
+        if (o_ctx_id) {
+            cqe_ctx_id = qnum_get_uint(qobject_to(QNum, o_ctx_id));
+            bctx = rdma_rm_get_cqe_ctx(backend_dev->rdma_dev_res, cqe_ctx_id);
+            if (bctx) {
+                rdma_rm_dealloc_cqe_ctx(backend_dev->rdma_dev_res, cqe_ctx_id);
+                g_free(bctx);
+            }
+        }
+    } while (o_ctx_id);
+    qemu_mutex_unlock(&backend_dev->mad_agent.recv_mads_list.lock);
+
+    backend_dev->mad_agent.recv_thread.is_running = false;
+
+    qemu_thread_exit(0);
+
+    return NULL;
+}
+
+static void start_mad_thread(RdmaBackendDev *backend_dev)
+{
+    char thread_name[THR_NAME_LEN] = {0};
+
+    while (backend_dev->mad_agent.recv_thread.is_running) {
+        pr_dbg("Still running, wating for it to complete before restarting\n");
+        sleep(1);
+    }
+
+    snprintf(thread_name, sizeof(thread_name), "rdma_mad_%s",
+             ibv_get_device_name(backend_dev->ib_dev));
+    backend_dev->mad_agent.recv_thread.run = true;
+    qemu_thread_create(&backend_dev->mad_agent.recv_thread.thread, thread_name,
+                       mad_handler_thread, backend_dev, QEMU_THREAD_DETACHED);
+}
+
+static void stop_mad_thread(RdmaBackendDev *backend_dev)
+{
+    backend_dev->mad_agent.recv_thread.run = false;
+}
+
+static int mad_init(RdmaBackendDev *backend_dev, int port_num)
+{
+    long method_mask[1];
+
+    backend_dev->mad_agent.port_id =
+        umad_open_port(backend_dev->context->device->name, port_num);
+
+    if (backend_dev->mad_agent.port_id < 0) {
+        pr_dbg("Fail to open MAD port, id=%d\n",
+               backend_dev->mad_agent.port_id);
+        return -EIO;
+    }
+
+    pr_dbg("MAD Agent port ID %d\n", backend_dev->mad_agent.port_id);
+
+    if (!MAD_SERVICE) {
+        return 0;
+    }
+
+    method_mask[0] = 0x8;
+    backend_dev->mad_agent.agent_id =
+        umad_register(backend_dev->mad_agent.port_id, MAD_SERVICE, 2, 0, method_mask);
+
+    if (backend_dev->mad_agent.agent_id < 0) {
+        pr_dbg("Fail to register MAD agent, id=%d\n",
+               backend_dev->mad_agent.port_id);
+        umad_close_port(backend_dev->mad_agent.port_id);
+        return -EIO;
+    }
+    pr_dbg("MAD Agent ID %d\n", backend_dev->mad_agent.agent_id);
+
+    qemu_mutex_init(&backend_dev->mad_agent.recv_mads_list.lock);
+    backend_dev->mad_agent.recv_mads_list.list = qlist_new();
+
+    backend_dev->mad_agent.recv_thread.run = false;
+    backend_dev->mad_agent.recv_thread.is_running = false;
+
+    return 0;
+}
+
+static void mad_fini(RdmaBackendDev *backend_dev)
+{
+    int ret;
+
+    pr_dbg("Closing MAD agent, port %d, agent %d\n",
+           backend_dev->mad_agent.port_id,
+           backend_dev->mad_agent.agent_id);
+
+    ret = umad_unregister(backend_dev->mad_agent.port_id,
+                          backend_dev->mad_agent.agent_id);
+    if (ret) {
+        pr_dbg("Fail to unregister MAD agent\n");
+    }
+
+    ret = umad_close_port(backend_dev->mad_agent.port_id);
+    if (ret) {
+        pr_dbg("Fail to close MAD port\n");
+    }
+
+    qlist_destroy_obj(QOBJECT(backend_dev->mad_agent.recv_mads_list.list));
+    qemu_mutex_destroy(&backend_dev->mad_agent.recv_mads_list.lock);
+}
+
+int rdma_backend_init(RdmaBackendDev *backend_dev, PCIDevice *pdev,
                       RdmaDeviceResources *rdma_dev_res,
                       const char *backend_device_name, uint8_t port_num,
                       uint8_t backend_gid_idx, struct ibv_device_attr *dev_attr,
@@ -706,9 +1042,12 @@ int rdma_backend_init(RdmaBackendDev *backend_dev,
     int i;
     int ret = 0;
     int num_ibv_devices;
-    char thread_name[THR_NAME_LEN] = {0};
     struct ibv_device **dev_list;
     struct ibv_port_attr port_attr;
+
+    memset(backend_dev, 0, sizeof(*backend_dev));
+
+    backend_dev->dev = pdev;
 
     backend_dev->backend_gid_idx = backend_gid_idx;
     backend_dev->port_num = port_num;
@@ -800,11 +1139,15 @@ int rdma_backend_init(RdmaBackendDev *backend_dev,
     pr_dbg("interface_id=0x%" PRIx64 "\n",
            be64_to_cpu(backend_dev->gid.global.interface_id));
 
-    snprintf(thread_name, sizeof(thread_name), "rdma_comp_%s",
-             ibv_get_device_name(backend_dev->ib_dev));
-    backend_dev->comp_thread.run = true;
-    qemu_thread_create(&backend_dev->comp_thread.thread, thread_name,
-                       comp_handler_thread, backend_dev, QEMU_THREAD_DETACHED);
+    ret = mad_init(backend_dev, backend_dev->port_num);
+    if (ret) {
+        error_setg(errp, "Fail to initialize umad agent");
+        ret = -EIO;
+        goto out_destroy_comm_channel;
+    }
+
+    backend_dev->comp_thread.run = false;
+    backend_dev->comp_thread.is_running = false;
 
     ah_cache_init();
 
@@ -823,8 +1166,25 @@ out:
     return ret;
 }
 
+
+void rdma_backend_start(RdmaBackendDev *backend_dev)
+{
+    pr_dbg("Starting rdma_backend\n");
+    start_comp_thread(backend_dev);
+    start_mad_thread(backend_dev);
+}
+
+void rdma_backend_stop(RdmaBackendDev *backend_dev)
+{
+    pr_dbg("Stopping rdma_backend\n");
+    stop_comp_thread(backend_dev);
+    stop_mad_thread(backend_dev);
+}
+
 void rdma_backend_fini(RdmaBackendDev *backend_dev)
 {
+    rdma_backend_stop(backend_dev);
+    mad_fini(backend_dev);
     g_hash_table_destroy(ah_hash);
     ibv_destroy_comp_channel(backend_dev->channel);
     ibv_close_device(backend_dev->context);

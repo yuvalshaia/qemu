@@ -89,8 +89,10 @@ static int pvrdma_post_cqe(PVRDMADev *dev, uint32_t cq_handle,
     pvrdma_ring_write_inc(&dev->dsr_info.cq);
 
     pr_dbg("cq->notify=%d\n", cq->notify);
-    if (cq->notify) {
-        cq->notify = false;
+    if (cq->notify != CNT_CLEAR) {
+        if (cq->notify == CNT_ARM) {
+            cq->notify = CNT_CLEAR;
+        }
         post_interrupt(dev, INTR_VEC_CMD_COMPLETION_Q);
     }
 
@@ -102,6 +104,7 @@ static void pvrdma_qp_ops_comp_handler(int status, unsigned int vendor_err,
 {
     CompHandlerCtx *comp_ctx = (CompHandlerCtx *)ctx;
 
+    pr_dbg("qpn=%ld\n", comp_ctx->cqe.qp);
     pr_dbg("cq_handle=%d\n", comp_ctx->cq_handle);
     pr_dbg("wr_id=%" PRIx64 "\n", comp_ctx->cqe.wr_id);
     pr_dbg("status=%d\n", status);
