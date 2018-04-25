@@ -37,6 +37,7 @@
 
 static Property pvrdma_dev_properties[] = {
     DEFINE_PROP_STRING("backend-dev", PVRDMADev, backend_device_name),
+    DEFINE_PROP_CHR("chardev", PVRDMADev, mad_chr),
     DEFINE_PROP_UINT8("backend-port", PVRDMADev, backend_port_num, 1),
     DEFINE_PROP_UINT8("backend-gid-idx", PVRDMADev, backend_gid_idx, 0),
     DEFINE_PROP_UINT64("dev-caps-max-mr-size", PVRDMADev, dev_attr.max_mr_size,
@@ -590,6 +591,7 @@ static void pvrdma_realize(PCIDevice *pdev, Error **errp)
     int rc;
     PVRDMADev *dev = PVRDMA_DEV(pdev);
     Object *memdev_root;
+    Chardev *mad_chr;
     bool ram_shared = false;
 
     init_pr_dbg();
@@ -610,6 +612,15 @@ static void pvrdma_realize(PCIDevice *pdev, Error **errp)
         error_setg(errp, "Only shared memory backed ram is supported");
         return;
     }
+
+    if (!qemu_chr_fe_backend_connected(&dev->mad_chr)) {
+        error_setg(errp, "You must specify a 'chardev' for MADs");
+        return;
+    }
+
+    mad_chr = qemu_chr_fe_get_driver(&dev->mad_chr);
+    assert(mad_chr);
+//    pr_debug("Using MAD server (socket = %s)\n", mad_chr->filename);
 
     dev->dsr_info.dsr = NULL;
 
