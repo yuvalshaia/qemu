@@ -413,6 +413,7 @@ dummy := $(call unnest-vars,, \
                 qga-obj-y \
                 ivshmem-client-obj-y \
                 ivshmem-server-obj-y \
+                rdmacm-server-obj-y \
                 libvhost-user-obj-y \
                 vhost-user-scsi-obj-y \
                 vhost-user-blk-obj-y \
@@ -709,6 +710,8 @@ endif
 vhost-user-scsi$(EXESUF): $(vhost-user-scsi-obj-y) libvhost-user.a
 	$(call LINK, $^)
 vhost-user-blk$(EXESUF): $(vhost-user-blk-obj-y) libvhost-user.a
+	$(call LINK, $^)
+rdmacm-server$(EXESUF): $(rdmacm-server-obj-y) $(COMMON_LDADDS)
 	$(call LINK, $^)
 
 module_block.h: $(SRC_PATH)/scripts/modules/module_block.py config-host.mak

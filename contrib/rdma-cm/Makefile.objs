@@ -1,0 +1,2 @@
+rdmacm-server-obj-y = main.o
+
