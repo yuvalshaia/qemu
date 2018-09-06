@@ -3078,6 +3078,8 @@ fi
 
 cat > $TMPC <<EOF &&
 #include <sys/mman.h>
+#include <libmnl/libmnl.h>
+#include <linux/rtnetlink.h>
 
 int
 main(void)
@@ -3090,11 +3092,14 @@ main(void)
 }
 EOF
 
+pvrdma_libs="-lmnl"
+
 if test "$rdma" = "yes" ; then
     case "$pvrdma" in
     "")
         if compile_prog "" ""; then
             pvrdma="yes"
+            libs_softmmu="$libs_softmmu $pvrdma_libs"
         else
             pvrdma="no"
         fi
@@ -3102,6 +3107,7 @@ if test "$rdma" = "yes" ; then
     "yes")
         if ! compile_prog "" ""; then
             error_exit "PVRDMA is not supported since mremap is not implemented"
+                       " or libmnl-devel is not installed"
         fi
         pvrdma="yes"
         ;;
@@ -6800,6 +6806,7 @@ fi
 
 if test "$pvrdma" = "yes" ; then
   echo "CONFIG_PVRDMA=y" >> $config_host_mak
+  echo "PVRDMA_LIBS=$pvrdma_libs" >> $config_host_mak
 fi
 
 if test "$have_rtnetlink" = "yes" ; then
