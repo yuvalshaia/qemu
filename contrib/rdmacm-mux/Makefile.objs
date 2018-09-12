@@ -1,3 +1,3 @@
-CFLAGS += -libumad -Wno-format-truncation
+CFLAGS += -libumad -lmnl -Wno-format-truncation
 rdmacm-mux-obj-y = main.o
 

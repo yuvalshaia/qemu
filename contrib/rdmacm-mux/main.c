@@ -1,5 +1,5 @@
 /*
- * QEMU paravirtual RDMA - Generic RDMA backend
+ * QEMU paravirtual RDMA - rdmacm-mux implementation
  *
  * Copyright (C) 2018 Oracle
  * Copyright (C) 2018 Red Hat Inc
@@ -19,18 +19,24 @@
 #include "pthread.h"
 #include "syslog.h"
 
+#include "linux/if_addr.h"
+#include "libmnl/libmnl.h"
+#include "linux/rtnetlink.h"
+#include "net/if.h"
+
 #include "infiniband/verbs.h"
 #include "infiniband/umad.h"
 #include "infiniband/umad_types.h"
 #include "infiniband/umad_sa.h"
 #include "infiniband/umad_cm.h"
 
+#include "rdmacm-mux.h"
+
 #define SCALE_US 1000
 #define COMMID_TTL 2 /* How many SCALE_US a context of MAD session is saved */
 #define SLEEP_SECS 5 /* This is used both in poll() and thread */
 #define SERVER_LISTEN_BACKLOG 10
 #define MAX_CLIENTS 4096
-#define MAD_BUF_SIZE 256
 #define MAD_RMPP_VERSION 0
 #define MAD_METHOD_MASK0 0x8
 
@@ -53,13 +59,13 @@ typedef struct RdmaCmServerArgs {
 typedef struct CommId2FdEntry {
     int fd;
     int ttl; /* Initialized to 2, decrement each timeout, entry delete when 0 */
+    __be64 gid_ifid;
 } CommId2FdEntry;
 
 typedef struct RdmaCmUMadAgent {
     int port_id;
     int agent_id;
     GHashTable *gid2fd; /* Used to find fd of a given gid */
-    GHashTable *fd2gid;  /* Used to find gid of a fd before it is closed */
     GHashTable *commid2fd; /* Used to find fd on of a given comm_id */
 } RdmaCmUMadAgent;
 
@@ -72,11 +78,6 @@ typedef struct RdmaCmServer {
     pthread_t umad_recv_thread;
     pthread_rwlock_t lock;
 } RdmaCMServer;
-
-typedef struct RdmaCmUMad {
-    struct ib_user_mad hdr;
-    char mad[MAD_BUF_SIZE];
-} RdmaCmUMad;
 
 RdmaCMServer server = {0};
 
@@ -149,8 +150,6 @@ static void hash_tbl_alloc(void)
     server.umad_agent.gid2fd = g_hash_table_new_full(g_int64_hash,
                                                      g_int64_equal,
                                                      g_free, g_free);
-    server.umad_agent.fd2gid = g_hash_table_new_full(g_int_hash, g_int_equal,
-                                                     g_free, g_free);
     server.umad_agent.commid2fd = g_hash_table_new_full(g_int_hash,
                                                         g_int_equal,
                                                         g_free, g_free);
@@ -161,47 +160,36 @@ static void hash_tbl_free(void)
     if (server.umad_agent.commid2fd) {
         g_hash_table_destroy(server.umad_agent.commid2fd);
     }
-    if (server.umad_agent.fd2gid) {
-        g_hash_table_destroy(server.umad_agent.fd2gid);
-    }
     if (server.umad_agent.gid2fd) {
         g_hash_table_destroy(server.umad_agent.gid2fd);
     }
 }
 
-static int hash_tbl_search_fd_by_gid(uint64_t gid)
+static int hash_tbl_search_fd_by_ifid(int *fd, __be64 *gid_ifid)
 {
-    int *fd;
+    int *fd1;
 
     pthread_rwlock_rdlock(&server.lock);
-    fd = g_hash_table_lookup(server.umad_agent.gid2fd, &gid);
+    fd1 = g_hash_table_lookup(server.umad_agent.gid2fd, gid_ifid);
+    if (!fd1) {
+        /* Let's try IPv4 */
+        *gid_ifid |= 0x00000000ffff0000;
+        fd1 = g_hash_table_lookup(server.umad_agent.gid2fd, gid_ifid);
+    }
     pthread_rwlock_unlock(&server.lock);
 
-    if (!fd) {
-        syslog(LOG_WARNING, "Can't find matching for gid 0x%lx\n", gid);
-        return -ENOENT;
+    if (!fd1) {
+        syslog(LOG_WARNING, "Can't find matching for ifid 0x%llx\n", *gid_ifid);
+        return ENOENT;
     }
 
-    return *fd;
+    *fd = *fd1;
+
+    return 0;
 }
 
-static uint64_t hash_tbl_search_gid(int fd)
-{
-    uint64_t *gid;
-
-    pthread_rwlock_rdlock(&server.lock);
-    gid = g_hash_table_lookup(server.umad_agent.fd2gid, &fd);
-    pthread_rwlock_unlock(&server.lock);
-
-    if (!gid) {
-        syslog(LOG_WARNING, "Can't find matching for fd %d\n", fd);
-        return 0;
-    }
-
-    return *gid;
-}
-
-static int hash_tbl_search_fd_by_comm_id(uint32_t comm_id)
+static int hash_tbl_search_fd_by_comm_id(uint32_t comm_id, int *fd,
+                                         __be64 *gid_idid)
 {
     CommId2FdEntry *fde;
 
@@ -211,25 +199,41 @@ static int hash_tbl_search_fd_by_comm_id(uint32_t comm_id)
 
     if (!fde) {
         syslog(LOG_WARNING, "Can't find matching for comm_id 0x%x\n", comm_id);
-        return 0;
+        return ENOENT;
     }
 
-    return fde->fd;
+    *fd = fde->fd;
+    *gid_idid = fde->gid_ifid;
+
+    return 0;
 }
 
-static void hash_tbl_save_fd_gid_pair(int fd, uint64_t gid)
+static void add_fd_ifid_pair(int fd, uint64_t gid_ifid)
 {
+
     pthread_rwlock_wrlock(&server.lock);
-    g_hash_table_insert(server.umad_agent.fd2gid, g_memdup(&fd, sizeof(fd)),
-                        g_memdup(&gid, sizeof(gid)));
-    g_hash_table_insert(server.umad_agent.gid2fd, g_memdup(&gid, sizeof(gid)),
-                        g_memdup(&fd, sizeof(fd)));
+    g_hash_table_insert(server.umad_agent.gid2fd, g_memdup(&gid_ifid,
+                        sizeof(gid_ifid)), g_memdup(&fd, sizeof(fd)));
     pthread_rwlock_unlock(&server.lock);
+
+    syslog(LOG_INFO, "0x%lx registered on socket %d", gid_ifid, fd);
 }
 
-static void hash_tbl_save_fd_comm_id_pair(int fd, uint32_t comm_id)
+static void delete_fd_ifid_pair(int fd, uint64_t gid_ifid)
 {
-    CommId2FdEntry fde = {fd, COMMID_TTL};
+
+    pthread_rwlock_wrlock(&server.lock);
+    g_hash_table_remove(server.umad_agent.gid2fd, g_memdup(&gid_ifid,
+                         sizeof(gid_ifid)));
+    pthread_rwlock_unlock(&server.lock);
+
+    syslog(LOG_INFO, "0x%lx unregistered on socket %d", gid_ifid, fd);
+}
+
+static void hash_tbl_save_fd_comm_id_pair(int fd, uint32_t comm_id,
+                                          uint64_t gid_ifid)
+{
+    CommId2FdEntry fde = {fd, COMMID_TTL, gid_ifid};
 
     pthread_rwlock_wrlock(&server.lock);
     g_hash_table_insert(server.umad_agent.commid2fd,
@@ -246,40 +250,39 @@ static gboolean remove_old_comm_ids(gpointer key, gpointer value,
     return !fde->ttl--;
 }
 
-static void hash_tbl_remove_fd_gid_pair(int fd)
+static gboolean remove_entry_from_gid2fd(gpointer key, gpointer value,
+                                         gpointer user_data)
 {
-    uint64_t gid;
+     return *(int *)value == *(int *)user_data;
+}
 
-    gid = hash_tbl_search_gid(fd);
-    if (!gid) {
-        return;
-    }
-
+static void hash_tbl_remove_fd_ifid_pair(int fd)
+{
     pthread_rwlock_wrlock(&server.lock);
-    g_hash_table_remove(server.umad_agent.fd2gid, &fd);
-    g_hash_table_remove(server.umad_agent.gid2fd, &gid);
+    g_hash_table_foreach_remove(server.umad_agent.gid2fd,
+                                remove_entry_from_gid2fd, (gpointer)&fd);
     pthread_rwlock_unlock(&server.lock);
 }
 
-static inline int get_fd(const char *mad)
+static int get_fd(const char *mad, int *fd, __be64 *gid_ifid)
 {
     struct umad_hdr *hdr = (struct umad_hdr *)mad;
     char *data = (char *)hdr + sizeof(*hdr);
-    int64_t gid;
     int32_t comm_id;
     uint16_t attr_id = be16toh(hdr->attr_id);
-
-    if (attr_id == UMAD_CM_ATTR_REQ) {
-        memcpy(&gid, data + CM_REQ_DGID_POS, sizeof(gid));
-        return hash_tbl_search_fd_by_gid(gid);
-    }
-
-    if (attr_id == UMAD_CM_ATTR_SIDR_REQ) {
-        memcpy(&gid, data + CM_SIDR_REQ_DGID_POS, sizeof(gid));
-        return hash_tbl_search_fd_by_gid(gid);
-    }
+    int rc;
 
     switch (attr_id) {
+    case UMAD_CM_ATTR_REQ:
+        memcpy(gid_ifid, data + CM_REQ_DGID_POS, sizeof(*gid_ifid));
+        rc = hash_tbl_search_fd_by_ifid(fd, gid_ifid);
+        break;
+
+    case UMAD_CM_ATTR_SIDR_REQ:
+        memcpy(gid_ifid, data + CM_SIDR_REQ_DGID_POS, sizeof(*gid_ifid));
+        rc = hash_tbl_search_fd_by_ifid(fd, gid_ifid);
+        break;
+
     case UMAD_CM_ATTR_REP:
         /* Fall through */
     case UMAD_CM_ATTR_REJ:
@@ -293,25 +296,27 @@ static inline int get_fd(const char *mad)
         /* Fall through */
     case UMAD_CM_ATTR_SIDR_REP:
         memcpy(&comm_id, data, sizeof(comm_id));
-        return hash_tbl_search_fd_by_comm_id(comm_id);
+        rc = hash_tbl_search_fd_by_comm_id(comm_id, fd, gid_ifid);
+        break;
+
+    default:
+        rc = EINVAL;
+        syslog(LOG_WARNING, "Unsupported attr_id 0x%x\n", attr_id);
     }
 
-    syslog(LOG_WARNING, "Unsupported attr_id 0x%x\n", attr_id);
-
-    return 0;
+    return rc;
 }
 
 static void *umad_recv_thread_func(void *args)
 {
     int rc;
-    RdmaCmUMad umad = {0};
-    int len;
-    int fd;
+    RdmaCmMuxMsg msg = {0};
+    int fd = -2;
 
     while (server.run) {
         do {
-            len = sizeof(umad.mad);
-            rc = umad_recv(server.umad_agent.port_id, &umad, &len,
+            msg.umad_len = sizeof(msg.umad.mad);
+            rc = umad_recv(server.umad_agent.port_id, &msg.umad, &msg.umad_len,
                            SLEEP_SECS * SCALE_US);
             if ((rc == -EIO) || (rc == -EINVAL)) {
                 syslog(LOG_CRIT, "Fatal error while trying to read MAD");
@@ -324,27 +329,81 @@ static void *umad_recv_thread_func(void *args)
         } while (rc && server.run);
 
         if (server.run) {
-            fd = get_fd(umad.mad);
-            if (!fd) {
+            rc = get_fd(msg.umad.mad, &fd, &msg.hdr.sgid.global.interface_id);
+            if (rc) {
                 continue;
             }
 
-            send(fd, &umad, sizeof(umad), 0);
+            send(fd, &msg, sizeof(msg), 0);
         }
     }
 
     return NULL;
 }
 
+static int netlink_route_update(char *ifname, union ibv_gid *gid, __u16 type)
+{
+    char buf[MNL_SOCKET_BUFFER_SIZE];
+    struct nlmsghdr *nlh;
+    struct ifaddrmsg *ifm;
+    struct mnl_socket *nl;
+    int ret;
+    uint32_t ipv4;
+
+    nl = mnl_socket_open(NETLINK_ROUTE);
+    if (!nl) {
+        syslog(LOG_WARNING, "Fail to connect to netlink\n");
+        return -EIO;
+    }
+
+    ret = mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID);
+    if (ret < 0) {
+        syslog(LOG_WARNING, "Fail to bind to netlink\n");
+        goto out;
+    }
+
+    nlh = mnl_nlmsg_put_header(buf);
+    nlh->nlmsg_type = type;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL;
+    nlh->nlmsg_seq = 1;
+
+    ifm = mnl_nlmsg_put_extra_header(nlh, sizeof(*ifm));
+    ifm->ifa_index = if_nametoindex(ifname);
+    if (gid->global.subnet_prefix) {
+        ifm->ifa_family = AF_INET6;
+        ifm->ifa_prefixlen = 64;
+        ifm->ifa_flags = IFA_F_PERMANENT;
+        ifm->ifa_scope = RT_SCOPE_UNIVERSE;
+        mnl_attr_put(nlh, IFA_ADDRESS, sizeof(*gid), gid);
+    } else {
+        ifm->ifa_family = AF_INET;
+        ifm->ifa_prefixlen = 24;
+        memcpy(&ipv4, (char *)&gid->global.interface_id + 4, sizeof(ipv4));
+        mnl_attr_put(nlh, IFA_LOCAL, 4, &ipv4);
+    }
+
+    ret = mnl_socket_sendto(nl, nlh, nlh->nlmsg_len);
+    if (ret < 0) {
+        syslog(LOG_WARNING, "Fail to send msg to to netlink\n");
+        goto out;
+    }
+
+    ret = 0;
+
+out:
+    mnl_socket_close(nl);
+    return ret;
+}
+
 static int read_and_process(int fd)
 {
     int rc;
-    RdmaCmUMad umad = {0};
+    RdmaCmMuxMsg msg = {0};
     struct umad_hdr *hdr;
     uint32_t *comm_id;
     uint16_t attr_id;
 
-    rc = recv(fd, &umad, sizeof(umad), 0);
+    rc = recv(fd, &msg, sizeof(msg), 0);
 
     if (rc < 0 && errno != EWOULDBLOCK) {
         return EIO;
@@ -354,31 +413,42 @@ static int read_and_process(int fd)
         return EPIPE;
     }
 
-    if (rc == sizeof(umad.hdr)) {
-        hash_tbl_save_fd_gid_pair(fd, umad.hdr.addr.ib_gid.global.interface_id);
+    switch (msg.hdr.msg_type) {
+    case RDMACM_MUX_MSG_TYPE_REG:
+        add_fd_ifid_pair(fd, msg.hdr.sgid.global.interface_id);
+        rc = netlink_route_update(msg.hdr.ifname, &msg.hdr.sgid, RTM_NEWADDR);
+        break;
 
-        syslog(LOG_INFO, "0x%llx registered on socket %d",
-               umad.hdr.addr.ib_gid.global.interface_id, fd);
+    case RDMACM_MUX_MSG_TYPE_UNREG:
+        delete_fd_ifid_pair(fd, msg.hdr.sgid.global.interface_id);
+        rc = netlink_route_update(msg.hdr.ifname, &msg.hdr.sgid, RTM_DELADDR);
+        break;
 
-        return 0;
-    }
+    case RDMACM_MUX_MSG_TYPE_MAD:
+        /* If this is REQ or REP then store the pair comm_id,fd to be later
+         * used for other messages where gid is unknown */
+        hdr = (struct umad_hdr *)msg.umad.mad;
+        attr_id = be16toh(hdr->attr_id);
+        if ((attr_id == UMAD_CM_ATTR_REQ) || (attr_id == UMAD_CM_ATTR_DREQ) ||
+            (attr_id == UMAD_CM_ATTR_SIDR_REQ) ||
+            (attr_id == UMAD_CM_ATTR_REP) || (attr_id == UMAD_CM_ATTR_DREP)) {
+            comm_id = (uint32_t *)(msg.umad.mad + sizeof(*hdr));
+            hash_tbl_save_fd_comm_id_pair(fd, *comm_id,
+                                          msg.hdr.sgid.global.interface_id);
+        }
 
-    hdr = (struct umad_hdr *)umad.mad;
-    attr_id = be16toh(hdr->attr_id);
+        rc = umad_send(server.umad_agent.port_id, server.umad_agent.agent_id,
+                       &msg.umad, msg.umad_len, 1, 0);
+        if (rc) {
+            syslog(LOG_WARNING, "Fail to send MAD message, err=%d", rc);
+        }
+        rc = 0;
+        break;
 
-    /* If this is REQ or REP then store the pair comm_id,fd to be later
-     * used for other messages where gid is unknown */
-    if ((attr_id == UMAD_CM_ATTR_REQ) || (attr_id == UMAD_CM_ATTR_DREQ) ||
-        (attr_id == UMAD_CM_ATTR_SIDR_REQ) ||
-        (attr_id == UMAD_CM_ATTR_REP) || (attr_id == UMAD_CM_ATTR_DREP)) {
-        comm_id = (uint32_t *)(umad.mad + sizeof(*hdr));
-        hash_tbl_save_fd_comm_id_pair(fd, *comm_id);
-    }
-
-    rc = umad_send(server.umad_agent.port_id, server.umad_agent.agent_id, &umad,
-                   umad.hdr.length, 1, 0);
-    if (rc) {
-        syslog(LOG_WARNING, "Fail to send MAD message, err=%d", rc);
+    default:
+        syslog(LOG_WARNING, "Got invalid message (%d) from %d",
+               msg.hdr.msg_type, fd);
+        rc = EINVAL;
     }
 
     return rc;
@@ -442,7 +512,7 @@ static void close_fd(int idx)
 {
     close(server.fds[idx].fd);
     syslog(LOG_INFO, "Socket %d closed\n", server.fds[idx].fd);
-    hash_tbl_remove_fd_gid_pair(server.fds[idx].fd);
+    hash_tbl_remove_fd_ifid_pair(server.fds[idx].fd);
     server.fds[idx].fd = 0;
 }
 
