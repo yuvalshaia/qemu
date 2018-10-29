@@ -18,6 +18,7 @@
 #include "qapi/error.h"
 #include "qapi/qmp/qlist.h"
 #include "qapi/qmp/qnum.h"
+#include "qapi/qapi-events-rdma.h"
 
 #include <infiniband/verbs.h>
 #include <infiniband/umad_types.h>
@@ -1020,6 +1021,7 @@ int rdma_backend_add_gid(RdmaBackendDev *backend_dev, const char *ifname,
 {
     RdmaCmMuxMsg msg = {0};
     int ret;
+    Error *errp;
 
     pr_dbg("0x%llx, 0x%llx\n",
            (long long unsigned int)be64_to_cpu(gid->global.subnet_prefix),
@@ -1035,6 +1037,10 @@ int rdma_backend_add_gid(RdmaBackendDev *backend_dev, const char *ifname,
         return -EIO;
     }
 
+    qapi_event_send_rdma_gid_status_changed(ifname, true,
+                                            gid->global.subnet_prefix,
+                                            gid->global.interface_id, &errp);
+
     return ret;
 }
 
@@ -1043,10 +1049,15 @@ int rdma_backend_del_gid(RdmaBackendDev *backend_dev, const char *ifname,
 {
     RdmaCmMuxMsg msg = {0};
     int ret;
+    Error *errp;
 
     pr_dbg("0x%llx, 0x%llx\n",
            (long long unsigned int)be64_to_cpu(gid->global.subnet_prefix),
            (long long unsigned int)be64_to_cpu(gid->global.interface_id));
+
+    qapi_event_send_rdma_gid_status_changed(ifname, false,
+                                            gid->global.subnet_prefix,
+                                            gid->global.interface_id, &errp);
 
     msg.hdr.msg_type = RDMACM_MUX_MSG_TYPE_UNREG;
     strcpy(msg.hdr.ifname, ifname);
