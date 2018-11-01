@@ -22,7 +22,8 @@
 
 int rdma_rm_init(RdmaDeviceResources *dev_res, struct ibv_device_attr *dev_attr,
                  Error **errp);
-void rdma_rm_fini(RdmaDeviceResources *dev_res);
+void rdma_rm_fini(RdmaDeviceResources *dev_res, RdmaBackendDev *backend_dev,
+                  const char *ifname);
 
 int rdma_rm_alloc_pd(RdmaDeviceResources *dev_res, RdmaBackendDev *backend_dev,
                      uint32_t *pd_handle, uint32_t ctx_handle);

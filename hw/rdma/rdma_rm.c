@@ -603,6 +603,17 @@ static void init_ports(RdmaDeviceResources *dev_res)
     }
 }
 
+static void fini_ports(RdmaDeviceResources *dev_res,
+                       RdmaBackendDev *backend_dev, const char *ifname)
+{
+    int i;
+
+    dev_res->ports[0].state = IBV_PORT_DOWN;
+    for (i = 0; i < MAX_PORT_GIDS; i++) {
+        rdma_rm_del_gid(dev_res, backend_dev, ifname, i);
+    }
+}
+
 int rdma_rm_init(RdmaDeviceResources *dev_res, struct ibv_device_attr *dev_attr,
                  Error **errp)
 {
@@ -625,8 +636,11 @@ int rdma_rm_init(RdmaDeviceResources *dev_res, struct ibv_device_attr *dev_attr,
     return 0;
 }
 
-void rdma_rm_fini(RdmaDeviceResources *dev_res)
+void rdma_rm_fini(RdmaDeviceResources *dev_res, RdmaBackendDev *backend_dev,
+                  const char *ifname)
 {
+    fini_ports(dev_res, backend_dev, ifname);
+
     res_tbl_free(&dev_res->uc_tbl);
     res_tbl_free(&dev_res->cqe_ctx_tbl);
     res_tbl_free(&dev_res->qp_tbl);
