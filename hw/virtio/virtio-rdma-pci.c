@@ -13,6 +13,7 @@
 
 #include "qemu/osdep.h"
 
+#include "hw/virtio/virtio-net-pci.h"
 #include "hw/virtio/virtio-rdma.h"
 #include "virtio-pci.h"
 #include "qapi/error.h"
@@ -42,9 +43,23 @@ static void virtio_rdma_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
 {
     VirtIORdmaPCI *dev = VIRTIO_RDMA_PCI(vpci_dev);
     DeviceState *vdev = DEVICE(&dev->vdev);
+    VirtIONetPCI *vnet_pci;
+    PCIDevice *func0;
 
     qdev_set_parent_bus(vdev, BUS(&vpci_dev->bus));
     object_property_set_bool(OBJECT(vdev), true, "realized", errp);
+
+    func0 = pci_get_function_0(&vpci_dev->pci_dev);
+    /* Break if not virtio device in slot 0 */
+    if (strcmp(object_get_typename(OBJECT(func0)), TYPE_VIRTIO_NET_PCI_GENERIC)) {
+        error_setg(errp, "Device on %x.0 is type %s but must be %s",
+                   PCI_SLOT(vpci_dev->pci_dev.devfn),
+		   object_get_typename(OBJECT(func0)),
+		   TYPE_VIRTIO_NET_PCI_GENERIC);
+        return;
+    }
+    vnet_pci = VIRTIO_NET_PCI(func0);
+    dev->vdev.netdev = &vnet_pci->vdev;
 }
 
 static void virtio_rdma_pci_class_init(ObjectClass *klass, void *data)
@@ -77,7 +92,7 @@ static void virtio_rdma_pci_instance_init(Object *obj)
 static const VirtioPCIDeviceTypeInfo virtio_rdma_pci_info = {
     .base_name             = TYPE_VIRTIO_RDMA_PCI,
     .generic_name          = "virtio-rdma-pci",
-    .transitional_name     = "virtio-nrdma-pci-transitional",
+    .transitional_name     = "virtio-rdma-pci-transitional",
     .non_transitional_name = "virtio-rdma-pci-non-transitional",
     .instance_size = sizeof(VirtIORdmaPCI),
     .instance_init = virtio_rdma_pci_instance_init,
