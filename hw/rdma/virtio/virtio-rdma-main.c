@@ -26,6 +26,7 @@
 /* TODO: Move to uapi header file */
 enum {
     VIRTIO_CMD_QUERY_DEVICE,
+    VIRTIO_CMD_QUERY_PORT,
 };
 struct control_buf {
     uint8_t cmd;
@@ -58,6 +59,23 @@ static int virtio_rdma_query_device(VirtIORdma *rdev, struct iovec *in,
     /* We start with sys_image_guid because of inconsistency beween ib_ and
      * ibv_ */
     offs = offsetof(struct ibv_device_attr, sys_image_guid);
+    s = iov_from_buf(out, 1, 0, (void *)&attr + offs, sizeof(attr) - offs);
+    assert(s == sizeof(attr) - offs);
+
+    return VIRTIO_RDMA_CTRL_OK;
+}
+static int virtio_rdma_query_port(VirtIORdma *rdev, struct iovec *in,
+                                  struct iovec *out)
+{
+    struct ibv_port_attr attr = {};
+    int offs;
+    size_t s;
+
+    attr.state = IBV_PORT_ACTIVE; /* TODO: should be combination of backend and netdev */
+    attr.gid_tbl_len = 256;
+
+    /* We start with stat because of inconsistency beween ib and ibv */
+    offs = offsetof(struct ibv_port_attr, state);
     s = iov_from_buf(out, 1, 0, (void *)&attr + offs, sizeof(attr) - offs);
     assert(s == sizeof(attr) - offs);
 
@@ -100,6 +118,10 @@ static void virtio_rdma_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
             case VIRTIO_CMD_QUERY_DEVICE:
                 cb.status = virtio_rdma_query_device(r, &e->out_sg[0],
                                                      &e->in_sg[0]);
+                break;
+            case VIRTIO_CMD_QUERY_PORT:
+                cb.status = virtio_rdma_query_port(r, &e->out_sg[0],
+                                                   &e->in_sg[0]);
                 break;
             default:
                 cb.status = VIRTIO_RDMA_CTRL_ERR;
