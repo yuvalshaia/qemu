@@ -51,11 +51,12 @@ static void virtio_rdma_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
 
     func0 = pci_get_function_0(&vpci_dev->pci_dev);
     /* Break if not virtio device in slot 0 */
-    if (strcmp(object_get_typename(OBJECT(func0)), TYPE_VIRTIO_NET_PCI_GENERIC)) {
+    if (strcmp(object_get_typename(OBJECT(func0)),
+               TYPE_VIRTIO_NET_PCI_GENERIC)) {
         error_setg(errp, "Device on %x.0 is type %s but must be %s",
                    PCI_SLOT(vpci_dev->pci_dev.devfn),
-		   object_get_typename(OBJECT(func0)),
-		   TYPE_VIRTIO_NET_PCI_GENERIC);
+                   object_get_typename(OBJECT(func0)),
+                   TYPE_VIRTIO_NET_PCI_GENERIC);
         return;
     }
     vnet_pci = VIRTIO_NET_PCI(func0);
