@@ -21,6 +21,7 @@
 #include "include/standard-headers/linux/virtio_ids.h"
 
 #include "virtio-rdma-ib.h"
+#include "../rdma_rm_defs.h"
 #include "../rdma_utils.h"
 
 static void virtio_rdma_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
@@ -80,6 +81,13 @@ static void virtio_rdma_device_realize(DeviceState *dev, Error **errp)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
     VirtIORdma *r = VIRTIO_RDMA(dev);
+    int rc;
+
+    rc = virtio_rdma_init_ib(r);
+    if (rc) {
+        rdma_error_report("Fail to initialize IB layer");
+        return;
+    }
 
     virtio_init(vdev, "virtio-rdma", VIRTIO_ID_RDMA, 1024);
 
@@ -89,10 +97,13 @@ static void virtio_rdma_device_realize(DeviceState *dev, Error **errp)
 static void virtio_rdma_device_unrealize(DeviceState *dev, Error **errp)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+    VirtIORdma *r = VIRTIO_RDMA(dev);
 
     virtio_del_queue(vdev, 0);
 
     virtio_cleanup(vdev);
+
+    virtio_rdma_fini_ib(r);
 }
 
 static uint64_t virtio_rdma_get_features(VirtIODevice *vdev, uint64_t features,
@@ -105,6 +116,26 @@ static uint64_t virtio_rdma_get_features(VirtIODevice *vdev, uint64_t features,
     return features;
 }
 
+
+static Property virtio_rdma_dev_properties[] = {
+    DEFINE_PROP_STRING("netdev", VirtIORdma, backend_eth_device_name),
+    DEFINE_PROP_STRING("ibdev",VirtIORdma, backend_device_name),
+    DEFINE_PROP_UINT8("ibport", VirtIORdma, backend_port_num, 1),
+    DEFINE_PROP_UINT64("dev-caps-max-mr-size", VirtIORdma, dev_attr.max_mr_size,
+                       MAX_MR_SIZE),
+    DEFINE_PROP_INT32("dev-caps-max-qp", VirtIORdma, dev_attr.max_qp, MAX_QP),
+    DEFINE_PROP_INT32("dev-caps-max-cq", VirtIORdma, dev_attr.max_cq, MAX_CQ),
+    DEFINE_PROP_INT32("dev-caps-max-mr", VirtIORdma, dev_attr.max_mr, MAX_MR),
+    DEFINE_PROP_INT32("dev-caps-max-pd", VirtIORdma, dev_attr.max_pd, MAX_PD),
+    DEFINE_PROP_INT32("dev-caps-qp-rd-atom", VirtIORdma,
+                       dev_attr.max_qp_rd_atom, MAX_QP_RD_ATOM),
+    DEFINE_PROP_INT32("dev-caps-max-qp-init-rd-atom", VirtIORdma,
+                      dev_attr.max_qp_init_rd_atom, MAX_QP_INIT_RD_ATOM),
+    DEFINE_PROP_INT32("dev-caps-max-ah", VirtIORdma, dev_attr.max_ah, MAX_AH),
+    DEFINE_PROP_CHR("mad-chardev", VirtIORdma, mad_chr),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
 static void virtio_rdma_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -114,6 +145,10 @@ static void virtio_rdma_class_init(ObjectClass *klass, void *data)
     vdc->realize = virtio_rdma_device_realize;
     vdc->unrealize = virtio_rdma_device_unrealize;
     vdc->get_features = virtio_rdma_get_features;
+
+    dc->desc = "Virtio RDMA Device";
+    dc->props = virtio_rdma_dev_properties;
+    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
 }
 
 static const TypeInfo virtio_rdma_info = {

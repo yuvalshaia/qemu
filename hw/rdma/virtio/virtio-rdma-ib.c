@@ -17,6 +17,8 @@
 
 #include "virtio-rdma-ib.h"
 #include "../rdma_utils.h"
+#include "../rdma_rm.h"
+#include "../rdma_backend.h"
 
 int virtio_rdma_query_device(VirtIORdma *rdev, struct iovec *in,
                              struct iovec *out)
@@ -114,4 +116,30 @@ int virtio_rdma_query_port(VirtIORdma *rdev, struct iovec *in,
 
     return s == sizeof(attr) - offs ? VIRTIO_RDMA_CTRL_OK :
                                       VIRTIO_RDMA_CTRL_ERR;
+}
+
+int virtio_rdma_init_ib(VirtIORdma *rdev)
+{
+    int rc;
+
+    rdev->rdma_res = g_malloc0(sizeof(RdmaDeviceResources));
+    rdev->backend_dev = g_malloc0(sizeof(RdmaBackendDev));
+
+    rc = rdma_backend_init(rdev->backend_dev, NULL, rdev->rdma_res,
+                           rdev->backend_device_name,
+                           rdev->backend_port_num, &rdev->dev_attr,
+                           &rdev->mad_chr);
+    if (rc) {
+        rdma_error_report("Fail to initialize backend device");
+        return rc;
+    }
+
+    return 0;
+}
+
+void virtio_rdma_fini_ib(VirtIORdma *rdev)
+{
+    rdma_backend_fini(rdev->backend_dev);
+    g_free(rdev->rdma_res);
+    g_free(rdev->backend_dev);
 }

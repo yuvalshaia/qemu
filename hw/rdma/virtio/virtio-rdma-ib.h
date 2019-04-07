@@ -37,6 +37,9 @@ struct cmd_query_port {
 #define VIRTIO_RDMA_PORT_CNT    1
 #define VIRTIO_RDMA_HW_VER      1
 
+int virtio_rdma_init_ib(VirtIORdma *rdev);
+void virtio_rdma_fini_ib(VirtIORdma *rdev);
+
 int virtio_rdma_query_device(VirtIORdma *rdev, struct iovec *in,
                              struct iovec *out);
 int virtio_rdma_query_port(VirtIORdma *rdev, struct iovec *in,
