@@ -3,4 +3,5 @@ obj-$(CONFIG_PCI) += rdma_utils.o rdma_backend.o rdma_rm.o rdma.o
 obj-$(CONFIG_PCI) += vmw/pvrdma_dev_ring.o vmw/pvrdma_cmd.o \
                      vmw/pvrdma_qp_ops.o vmw/pvrdma_main.o
 endif
-obj-$(CONFIG_VIRTIO_RDMA) += virtio/virtio-rdma-main.o
+obj-$(CONFIG_VIRTIO_RDMA) += virtio/virtio-rdma-main.o \
+                             virtio/virtio-rdma-ib.o
