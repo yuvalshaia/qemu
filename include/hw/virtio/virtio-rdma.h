@@ -33,7 +33,7 @@ typedef struct VirtIORdma {
     VirtQueue *ctrl_vq;
     VirtIONet *netdev;
     RdmaBackendDev *backend_dev;
-    RdmaDeviceResources *rdma_res;
+    RdmaDeviceResources *rdma_dev_res;
     CharBackend mad_chr;
     char *backend_eth_device_name;
     char *backend_device_name;

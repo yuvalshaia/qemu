@@ -118,14 +118,80 @@ int virtio_rdma_query_port(VirtIORdma *rdev, struct iovec *in,
                                       VIRTIO_RDMA_CTRL_ERR;
 }
 
+int virtio_rdma_create_cq(VirtIORdma *rdev, struct iovec *in,
+                          struct iovec *out)
+{
+    struct cmd_create_cq cmd = {};
+    struct rsp_create_cq rsp = {};
+    size_t s;
+    int rc;
+
+    s = iov_to_buf(in, 1, 0, &cmd, sizeof(cmd));
+    if (s != sizeof(cmd)) {
+        return VIRTIO_RDMA_CTRL_ERR;
+    }
+
+    /* TODO: Define MAX_CQE */
+#define MAX_CQE 1024
+    /* TODO: Check MAX_CQ */
+    if (cmd.cqe > MAX_CQE) {
+        return VIRTIO_RDMA_CTRL_ERR;
+    }
+
+    printf("%s: %d\n", __func__, cmd.cqe);
+
+    /* TODO: Create VirtQ */
+
+    rc = rdma_rm_alloc_cq(rdev->rdma_dev_res, rdev->backend_dev, cmd.cqe,
+                          &rsp.cqn, NULL);
+    if (rc) {
+        /* TODO: Destroy VirtQ */
+        return VIRTIO_RDMA_CTRL_ERR;
+    }
+
+    printf("%s: %d\n", __func__, rsp.cqn);
+
+    s = iov_from_buf(out, 1, 0, &rsp, sizeof(rsp));
+
+    return s == sizeof(rsp) ? VIRTIO_RDMA_CTRL_OK :
+                              VIRTIO_RDMA_CTRL_ERR;
+}
+
+int virtio_rdma_destroy_cq(VirtIORdma *rdev, struct iovec *in,
+                          struct iovec *out)
+{
+    struct cmd_destroy_cq cmd = {};
+    size_t s;
+
+    s = iov_to_buf(in, 1, 0, &cmd, sizeof(cmd));
+    if (s != sizeof(cmd)) {
+        return VIRTIO_RDMA_CTRL_ERR;
+    }
+
+    printf("%s: %d\n", __func__, cmd.cqn);
+
+    /* TODO: Destroy VirtQ */
+
+    rdma_rm_dealloc_cq(rdev->rdma_dev_res, cmd.cqn);
+
+    return VIRTIO_RDMA_CTRL_OK;
+}
+
+static void virtio_rdma_init_dev_caps(VirtIORdma *rdev)
+{
+    rdev->dev_attr.max_qp_wr = 1024;
+}
+
 int virtio_rdma_init_ib(VirtIORdma *rdev)
 {
     int rc;
 
-    rdev->rdma_res = g_malloc0(sizeof(RdmaDeviceResources));
+    virtio_rdma_init_dev_caps(rdev);
+
+    rdev->rdma_dev_res = g_malloc0(sizeof(RdmaDeviceResources));
     rdev->backend_dev = g_malloc0(sizeof(RdmaBackendDev));
 
-    rc = rdma_backend_init(rdev->backend_dev, NULL, rdev->rdma_res,
+    rc = rdma_backend_init(rdev->backend_dev, NULL, rdev->rdma_dev_res,
                            rdev->backend_device_name,
                            rdev->backend_port_num, &rdev->dev_attr,
                            &rdev->mad_chr);
@@ -134,12 +200,23 @@ int virtio_rdma_init_ib(VirtIORdma *rdev)
         return rc;
     }
 
+    rc = rdma_rm_init(rdev->rdma_dev_res, &rdev->dev_attr);
+    if (rc) {
+        rdma_error_report("Fail to initialize resource manager");
+        return rc;
+    }
+
+    /* rdma_backend_start(rdev->backend_dev); */
+
     return 0;
 }
 
 void virtio_rdma_fini_ib(VirtIORdma *rdev)
 {
+    /* rdma_backend_stop(rdev->backend_dev); */
+    rdma_rm_fini(rdev->rdma_dev_res, rdev->backend_dev,
+                 rdev->backend_eth_device_name);
     rdma_backend_fini(rdev->backend_dev);
-    g_free(rdev->rdma_res);
+    g_free(rdev->rdma_dev_res);
     g_free(rdev->backend_dev);
 }

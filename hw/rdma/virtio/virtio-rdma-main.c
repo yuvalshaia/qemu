@@ -61,11 +61,18 @@ static void virtio_rdma_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
                 cb.status = virtio_rdma_query_port(r, &e->out_sg[1],
                                                    &e->in_sg[0]);
                 break;
+            case VIRTIO_CMD_CREATE_CQ:
+                cb.status = virtio_rdma_create_cq(r, &e->out_sg[1],
+                                                  &e->in_sg[0]);
+                break;
+            case VIRTIO_CMD_DESTROY_CQ:
+                cb.status = virtio_rdma_destroy_cq(r, &e->out_sg[1],
+                                                  &e->in_sg[0]);
+                break;
             default:
                 cb.status = VIRTIO_RDMA_CTRL_ERR;
             }
         }
-        cb.status = VIRTIO_RDMA_CTRL_OK;
         printf("status=%d\n", cb.status);
         s = iov_from_buf(&e->in_sg[1], 1, 0, &cb.status, sizeof(cb.status));
         assert(s == sizeof(cb.status));

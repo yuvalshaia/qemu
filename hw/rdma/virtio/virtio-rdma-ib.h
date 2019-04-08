@@ -22,6 +22,8 @@
 enum {
     VIRTIO_CMD_QUERY_DEVICE = 10,
     VIRTIO_CMD_QUERY_PORT,
+    VIRTIO_CMD_CREATE_CQ,
+    VIRTIO_CMD_DESTROY_CQ,
 };
 
 struct control_buf {
@@ -32,6 +34,19 @@ struct control_buf {
 struct cmd_query_port {
     uint8_t port;
 };
+
+struct cmd_create_cq {
+    uint32_t cqe;
+};
+
+struct rsp_create_cq {
+    uint32_t cqn;
+};
+
+struct cmd_destroy_cq {
+    uint32_t cqn;
+};
+
 /* TODO: Move to uapi header file */
 
 #define VIRTIO_RDMA_PORT_CNT    1
@@ -44,3 +59,7 @@ int virtio_rdma_query_device(VirtIORdma *rdev, struct iovec *in,
                              struct iovec *out);
 int virtio_rdma_query_port(VirtIORdma *rdev, struct iovec *in,
                            struct iovec *out);
+int virtio_rdma_create_cq(VirtIORdma *rdev, struct iovec *in,
+                          struct iovec *out);
+int virtio_rdma_destroy_cq(VirtIORdma *rdev, struct iovec *in,
+                          struct iovec *out);
