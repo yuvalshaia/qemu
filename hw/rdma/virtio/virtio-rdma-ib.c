@@ -177,6 +177,47 @@ int virtio_rdma_destroy_cq(VirtIORdma *rdev, struct iovec *in,
     return VIRTIO_RDMA_CTRL_OK;
 }
 
+int virtio_rdma_create_pd(VirtIORdma *rdev, struct iovec *in,
+                          struct iovec *out)
+{
+    struct rsp_create_pd rsp = {};
+    size_t s;
+    int rc;
+
+    /* TODO: Check MAX_PD */
+
+    /* TODO: ctx */
+    rc = rdma_rm_alloc_pd(rdev->rdma_dev_res, rdev->backend_dev, &rsp.pdn,
+                          0);
+    if (rc)
+        return VIRTIO_RDMA_CTRL_ERR;
+
+    printf("%s: %d\n", __func__, rsp.pdn);
+
+    s = iov_from_buf(out, 1, 0, &rsp, sizeof(rsp));
+
+    return s == sizeof(rsp) ? VIRTIO_RDMA_CTRL_OK :
+                              VIRTIO_RDMA_CTRL_ERR;
+}
+
+int virtio_rdma_destroy_pd(VirtIORdma *rdev, struct iovec *in,
+                          struct iovec *out)
+{
+    struct cmd_destroy_pd cmd = {};
+    size_t s;
+
+    s = iov_to_buf(in, 1, 0, &cmd, sizeof(cmd));
+    if (s != sizeof(cmd)) {
+        return VIRTIO_RDMA_CTRL_ERR;
+    }
+
+    printf("%s: %d\n", __func__, cmd.pdn);
+
+    rdma_rm_dealloc_cq(rdev->rdma_dev_res, cmd.pdn);
+
+    return VIRTIO_RDMA_CTRL_OK;
+}
+
 static void virtio_rdma_init_dev_caps(VirtIORdma *rdev)
 {
     rdev->dev_attr.max_qp_wr = 1024;
