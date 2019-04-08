@@ -26,6 +26,7 @@ enum {
     VIRTIO_CMD_DESTROY_CQ,
     VIRTIO_CMD_CREATE_PD,
     VIRTIO_CMD_DESTROY_PD,
+    VIRTIO_CMD_GET_DMA_MR,
 };
 
 struct control_buf {
@@ -57,6 +58,17 @@ struct cmd_destroy_pd {
     uint32_t pdn;
 };
 
+struct cmd_get_dma_mr {
+    uint32_t pdn;
+    uint32_t access_flags;
+};
+
+struct rsp_get_dma_mr {
+    uint32_t mrn;
+    uint32_t lkey;
+    uint32_t rkey;
+};
+
 /* TODO: Move to uapi header file */
 
 #define VIRTIO_RDMA_PORT_CNT    1
@@ -77,3 +89,5 @@ int virtio_rdma_create_pd(VirtIORdma *rdev, struct iovec *in,
                           struct iovec *out);
 int virtio_rdma_destroy_pd(VirtIORdma *rdev, struct iovec *in,
                           struct iovec *out);
+int virtio_rdma_get_dma_mr(VirtIORdma *rdev, struct iovec *in,
+                           struct iovec *out);

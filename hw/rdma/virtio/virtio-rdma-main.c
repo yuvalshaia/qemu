@@ -77,6 +77,10 @@ static void virtio_rdma_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
                 cb.status = virtio_rdma_destroy_pd(r, &e->out_sg[1],
                                                   &e->in_sg[0]);
                 break;
+            case VIRTIO_CMD_GET_DMA_MR:
+                cb.status = virtio_rdma_get_dma_mr(r, &e->out_sg[1],
+                                                  &e->in_sg[0]);
+                break;
             default:
                 cb.status = VIRTIO_RDMA_CTRL_ERR;
             }

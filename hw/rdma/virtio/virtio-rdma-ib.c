@@ -218,6 +218,30 @@ int virtio_rdma_destroy_pd(VirtIORdma *rdev, struct iovec *in,
     return VIRTIO_RDMA_CTRL_OK;
 }
 
+int virtio_rdma_get_dma_mr(VirtIORdma *rdev, struct iovec *in,
+                           struct iovec *out)
+{
+    struct cmd_get_dma_mr cmd = {};
+    struct rsp_get_dma_mr rsp = {};
+    size_t s;
+
+    s = iov_to_buf(in, 1, 0, &cmd, sizeof(cmd));
+    if (s != sizeof(cmd)) {
+        return VIRTIO_RDMA_CTRL_ERR;
+    }
+
+    /* TODO: Call rdma_rm_alloc_mr */
+    rsp.mrn = 0x10;
+    rsp.lkey = 0x11;
+    rsp.rkey = 0x12;
+    printf("%s: 0x%x\n", __func__, rsp.mrn);
+
+    s = iov_from_buf(out, 1, 0, &rsp, sizeof(rsp));
+
+    return s == sizeof(rsp) ? VIRTIO_RDMA_CTRL_OK :
+                              VIRTIO_RDMA_CTRL_ERR;
+}
+
 static void virtio_rdma_init_dev_caps(VirtIORdma *rdev)
 {
     rdev->dev_attr.max_qp_wr = 1024;
