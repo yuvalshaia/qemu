@@ -227,20 +227,18 @@ int rdma_rm_alloc_mr(RdmaDeviceResources *dev_res, uint32_t pd_handle,
         mr->length = guest_length;
         mr->virt += (mr->start & (TARGET_PAGE_SIZE - 1));
 
-#ifdef LEGACY_RDMA_REG_MR
-        ret = rdma_backend_create_mr(&mr->backend_mr, &pd->backend_pd, mr->virt,
-                                     mr->length, access_flags);
-        /* We keep mr_handle in lkey so send and recv get get mr ptr */
-        *lkey = *mr_handle;
-#else
         ret = rdma_backend_create_mr(&mr->backend_mr, &pd->backend_pd, mr->virt,
                                      mr->length, guest_start, access_flags);
-        *lkey = rdma_backend_mr_lkey(&mr->backend_mr);
-#endif
         if (ret) {
             ret = -EIO;
             goto out_dealloc_mr;
         }
+#ifdef LEGACY_RDMA_REG_MR
+        /* We keep mr_handle in lkey so send and recv get get mr ptr */
+        *lkey = *mr_handle;
+#else
+        *lkey = rdma_backend_mr_lkey(&mr->backend_mr);
+#endif
     }
 
     *rkey = -1;
