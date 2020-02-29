@@ -230,9 +230,12 @@ int rdma_rm_alloc_mr(RdmaDeviceResources *dev_res, uint32_t pd_handle,
 #ifdef LEGACY_RDMA_REG_MR
         ret = rdma_backend_create_mr(&mr->backend_mr, &pd->backend_pd, mr->virt,
                                      mr->length, access_flags);
+        /* We keep mr_handle in lkey so send and recv get get mr ptr */
+        *lkey = *mr_handle;
 #else
         ret = rdma_backend_create_mr(&mr->backend_mr, &pd->backend_pd, mr->virt,
                                      mr->length, guest_start, access_flags);
+        *lkey = rdma_backend_mr_lkey(&mr->backend_mr);
 #endif
         if (ret) {
             ret = -EIO;
@@ -240,8 +243,6 @@ int rdma_rm_alloc_mr(RdmaDeviceResources *dev_res, uint32_t pd_handle,
         }
     }
 
-    /* We keep mr_handle in lkey so send and recv get get mr ptr */
-    *lkey = *mr_handle;
     *rkey = -1;
 
     mr->pd_handle = pd_handle;
